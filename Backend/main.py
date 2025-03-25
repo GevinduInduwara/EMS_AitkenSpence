@@ -3,16 +3,17 @@ from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from datetime import datetime, timedelta
 from jose import JWTError, jwt
 from passlib.context import CryptContext
-from typing import Optional
+from typing import Optional, List
 import os
-from models import User, UserInDB, Token, TokenData, EmployeeProfile, AttendanceRecord
-from database import get_db, SessionLocal
+from models import User, UserInDB, Token, TokenData, EmployeeProfile, AttendanceRecord, DBUser
+from database import get_db, SessionLocal, Base, engine
 from sqlalchemy.orm import Session
+from pydantic import BaseModel
 
 app = FastAPI()
 
 # Security Configuration
-SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-here")
+SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-here")  # Change in production
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
 
@@ -27,10 +28,10 @@ def verify_password(plain_password: str, hashed_password: str):
 def get_password_hash(password: str):
     return pwd_context.hash(password)
 
-def get_user(db: Session, emp_no: str):
+def get_user(db: Session, emp_no: int):
     return db.query(DBUser).filter(DBUser.emp_no == emp_no).first()
 
-def authenticate_user(db: Session, emp_no: str, password: str):
+def authenticate_user(db: Session, emp_no: int, password: str):
     user = get_user(db, emp_no)
     if not user:
         return False
@@ -59,14 +60,14 @@ async def get_current_user(
     )
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        emp_no: str = payload.get("sub")
+        emp_no: int = int(payload.get("sub"))  # Convert to int
         if emp_no is None:
             raise credentials_exception
-        token_data = TokenData(username=emp_no)
-    except JWTError:
+        token_data = TokenData(username=str(emp_no))
+    except (JWTError, ValueError) as e:
         raise credentials_exception
     
-    user = get_user(db, emp_no=token_data.username)
+    user = get_user(db, emp_no=emp_no)
     if user is None:
         raise credentials_exception
     return user
@@ -83,25 +84,25 @@ async def get_current_oic(current_user: User = Depends(get_current_user)):
 def initialize_test_data():
     db = SessionLocal()
     try:
-        if not db.query(DBUser).filter(DBUser.emp_no == "11138").first():
+        if not db.query(DBUser).filter(DBUser.emp_no == 11138).first():
             test_oic = DBUser(
-                emp_no="11138",
+                emp_no=11138,
                 name="M.A.G.I Malwaththa",
                 rank="OIC",
-                tel="+94 123456789",
+                tel=123456789,
                 site_name="Aitken Spence HQ",
                 security_firm="Oracle",
                 hashed_password=get_password_hash("testpassword"),
                 role="OIC",
-                managed_employees=["11139", "11140"]
+                managed_employees=[11139, 11140]
             )
             db.add(test_oic)
             
             test_employee1 = DBUser(
-                emp_no="11139",
+                emp_no=11139,
                 name="Employee One",
                 rank="Security",
-                tel="+94 987654321",
+                tel=987654321,
                 site_name="Aitken Spence HQ",
                 security_firm="Oracle",
                 hashed_password=get_password_hash("testpassword"),
@@ -111,10 +112,10 @@ def initialize_test_data():
             db.add(test_employee1)
             
             test_employee2 = DBUser(
-                emp_no="11140",
+                emp_no=11140,
                 name="Employee Two",
                 rank="Security",
-                tel="+94 987654322",
+                tel=987654322,
                 site_name="Aitken Spence HQ",
                 security_firm="Oracle",
                 hashed_password=get_password_hash("testpassword"),
@@ -127,7 +128,7 @@ def initialize_test_data():
         db.close()
 
 @app.on_event("startup")
-def startup_event():
+async def startup_event():
     try:
         # Test database connection
         db = SessionLocal()
@@ -150,7 +151,15 @@ async def login_for_access_token(
     form_data: OAuth2PasswordRequestForm = Depends(),
     db: Session = Depends(get_db)
 ):
-    user = authenticate_user(db, form_data.username, form_data.password)
+    try:
+        emp_no = int(form_data.username)  # Convert username to int
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Employee number must be numeric"
+        )
+    
+    user = authenticate_user(db, emp_no, form_data.password)
     if not user:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -166,9 +175,12 @@ async def login_for_access_token(
     
     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     access_token = create_access_token(
-        data={"sub": user.emp_no}, expires_delta=access_token_expires
+        data={"sub": str(user.emp_no)},  # Convert to string for JWT
+        expires_delta=access_token_expires
     )
     return {"access_token": access_token, "token_type": "bearer", "role": user.role}
 
-# Add all your other endpoints here...
-# [Include all your existing endpoints from the original code]
+# Example endpoint
+@app.get("/users/me", response_model=User)
+async def read_users_me(current_user: User = Depends(get_current_user)):
+    return current_user
