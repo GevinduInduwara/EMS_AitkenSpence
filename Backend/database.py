@@ -4,8 +4,8 @@ import os
 
 # Database configuration
 DB_HOST = os.getenv("DB_HOST", "localhost")
-DB_USER = os.getenv("DB_USER", "fastapi_user")
-DB_PASSWORD = os.getenv("DB_PASSWORD", "your_password")
+DB_USER = os.getenv("DB_USER", "Gevindu")
+DB_PASSWORD = os.getenv("DB_PASSWORD", "root")
 DB_NAME = os.getenv("DB_NAME", "security_attendance")
 
 SQLALCHEMY_DATABASE_URL = f"mysql+pymysql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}/{DB_NAME}"
