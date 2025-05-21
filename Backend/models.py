@@ -3,46 +3,105 @@ from psycopg2 import pool, extras
 from dotenv import load_dotenv
 import os
 import bcrypt
+import jwt
+import time
 
 load_dotenv()
 
-# Create connection pool
+# Connection settings
+DB_CONFIG = {
+    'host': os.getenv("DB_HOST", "localhost"),
+    'port': os.getenv("DB_PORT", "5433"),
+    'database': os.getenv("DB_NAME", "Security-Attendance"),
+    'user': os.getenv("DB_USER", "postgres"),
+    'password': os.getenv("DB_PASSWORD", "Gevindu"),
+    'connect_timeout': 5
+}
+
+# Simple connection pool with a fixed size
+MAX_CONNECTIONS = 20
 connection_pool = None
 
-def initialize_connection_pool():
-    global connection_pool
-    if connection_pool is None:
-        connection_pool = psycopg2.pool.SimpleConnectionPool(
-            1,  # minconn
-            20,  # increased maxconn
-            host=os.getenv("DB_HOST", "localhost"),
-            port=os.getenv("DB_PORT", "5433"),
-            database=os.getenv("DB_NAME", "Security-Attendance"),
-            user=os.getenv("DB_USER", "postgres"),
-            password=os.getenv("DB_PASSWORD", "Gevindu"),
-            connect_timeout=30,  # 30 second connection timeout
-            options='-c statement_timeout=30000'  # 30 second query timeout
-        )
-    return connection_pool
-
 def get_db_connection():
-    try:
-        pool = initialize_connection_pool()
-        return pool.getconn()
-    except Exception as e:
-        print(f"Error connecting to database: {str(e)}")
-        raise
+    """Get a database connection with retry logic."""
+    max_retries = 3
+    retry_delay = 1
+    last_error = None
+    
+    for attempt in range(max_retries):
+        conn = None
+        try:
+            # Create a new connection
+            conn = psycopg2.connect(
+                host=os.getenv("DB_HOST", "localhost"),
+                port=os.getenv("DB_PORT", "5433"),
+                database=os.getenv("DB_NAME", "Security-Attendance"),
+                user=os.getenv("DB_USER", "postgres"),
+                password=os.getenv("DB_PASSWORD", "Gevindu"),
+                connect_timeout=5
+            )
+            conn.autocommit = False
+            
+            # Test the connection
+            with conn.cursor() as cur:
+                cur.execute('SELECT 1')
+                
+            print(f"Successfully connected to database (attempt {attempt + 1})")
+            return conn
+            
+        except Exception as e:
+            last_error = e
+            print(f"Database connection attempt {attempt + 1} failed: {str(e)}")
+            
+            # Clean up any broken connections
+            if conn is not None:
+                try:
+                    if not conn.closed:
+                        conn.close()
+                except Exception as close_error:
+                    print(f"Error closing connection: {str(close_error)}")
+            
+            if attempt == max_retries - 1:  # Last attempt
+                print("Max retries reached, giving up")
+                raise Exception(f"Failed to connect to database after {max_retries} attempts. Last error: {str(last_error)}")
+                
+            # Wait before retrying
+            time.sleep(retry_delay)
+            retry_delay *= 2  # Exponential backoff
+            
+    # This should never be reached due to the raise in the last attempt
+    raise Exception("Unexpected error in get_db_connection")
 
 def close_db_connection(conn):
-    if conn:
+    """Safely close the database connection."""
+    if not conn:
+        return
+
+    try:
+        # Check if the connection is already closed
+        if conn.closed:
+            print("Connection already closed")
+            return
+            
+        # Try to rollback any pending transactions
         try:
-            conn.commit()
-        except:
-            pass
+            conn.rollback()
+        except Exception as rollback_error:
+            print(f"Error during rollback: {str(rollback_error)}")
+            
+        # Close the connection
+        conn.close()
+        print("Database connection closed successfully")
+        
+    except Exception as e:
+        print(f"Error closing database connection: {str(e)}")
+        
+        # If we get here, try a more forceful close
         try:
-            connection_pool.putconn(conn)
-        except:
-            conn.close()
+            if not conn.closed:
+                conn.close()
+        except Exception as force_close_error:
+            print(f"Error during forced connection close: {str(force_close_error)}")
 
 def hash_password(password):
     return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
@@ -97,76 +156,132 @@ def get_employees_by_rank(rank):
 
 def get_employee_by_id(employee_id):
     conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT emp_no, name, role, tel, 
-               company_name, security_firm, rank
-        FROM employees 
-        WHERE id = %s
-    """, (employee_id,))
-    employee = cursor.fetchone()
-    cursor.close()
-    close_db_connection(conn)
-    return employee
+    cursor = conn.cursor(cursor_factory=extras.RealDictCursor)
+    try:
+        cursor.execute("""
+            SELECT emp_no, name, role, tel, 
+                   company_name, security_firm, rank
+            FROM employees 
+            WHERE id = %s
+        """, (employee_id,))
+        employee = cursor.fetchone()
+        return dict(employee) if employee else None
+    except Exception as e:
+        print(f"Error fetching employee by ID: {e}")
+        return None
+    finally:
+        if cursor:
+            try:
+                cursor.close()
+            except:
+                pass
+        if conn:
+            close_db_connection(conn)
 
 def get_employee_by_nic(nic):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT emp_no, name, role, department, tel, 
-               company_name, security_firm, rank
-        FROM employees 
-        WHERE nic = %s
-    """, (nic,))
-    employee = cursor.fetchone()
-    cursor.close()
-    close_db_connection(conn)
-    return employee
+    conn = None
+    cursor = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor(cursor_factory=extras.RealDictCursor)
+        
+        cursor.execute("""
+            SELECT emp_no, name, role, department, tel, 
+                   company_name, security_firm, rank
+            FROM employees 
+            WHERE nic = %s
+        """, (nic,))
+        employee = cursor.fetchone()
+        return dict(employee) if employee else None
+    except Exception as e:
+        print(f"Error fetching employee by NIC: {e}")
+        return None
+    finally:
+        if cursor:
+            try:
+                cursor.close()
+            except:
+                pass
+        if conn:
+            close_db_connection(conn)
 
 def get_employee_by_emp_no(emp_no):
-    conn = get_db_connection()
-    cursor = conn.cursor()
+    """Get a single employee by employee number."""
+    conn = None
+    cursor = None
     try:
-        try:
-            cursor.execute("""
-                SELECT emp_no, name, role, tel, company_name, security_firm, rank
-                FROM employees 
-                WHERE emp_no = %s
-            """, (emp_no,))
-            employee = cursor.fetchone()
-            return employee
-        except Exception as e:
-            print(f"Error fetching employee by emp_no: {emp_no}, error: {e}")
-            return None
+        conn = get_db_connection()
+        cursor = conn.cursor(cursor_factory=extras.RealDictCursor)
+        
+        cursor.execute("""
+            SELECT emp_no, name, role, tel, security_firm, rank, company_name
+            FROM employees
+            WHERE emp_no = %s
+        """, (emp_no,))
+        
+        result = cursor.fetchone()
+        return result
+        
+    except Exception as e:
+        print(f"Error in get_employee_by_emp_no: {str(e)}")
+        raise
     finally:
-        cursor.close()
-        close_db_connection(conn)
+        if cursor:
+            try:
+                cursor.close()
+            except Exception as e:
+                print(f"Error closing cursor: {str(e)}")
+        if conn:
+            close_db_connection(conn)
 
 def mark_attendance(emp_no, shift_start_time, shift_end_time):
     """Mark attendance with shift times"""
-    conn = get_db_connection()
-    cursor = conn.cursor()
+    conn = None
+    cursor = None
     try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # First check if employee exists
+        cursor.execute("SELECT emp_no, company_name FROM employees WHERE emp_no = %s", (emp_no,))
+        employee = cursor.fetchone()
+        
+        if not employee:
+            print(f"Employee with emp_no {emp_no} not found")
+            return False
+            
+        # Insert attendance record
         cursor.execute("""
             INSERT INTO attendance (
                 emp_no, call_date, call_time, status,
                 shift_start_time, shift_end_time, company_name
             )
-            SELECT 
-                e.emp_no, CURRENT_DATE, CURRENT_TIME, 'called',
-                %s, %s, e.company_name
-            FROM employees e
-            WHERE e.emp_no = %s
-        """, (shift_start_time, shift_end_time, emp_no))
+            VALUES (%s, CURRENT_DATE, CURRENT_TIME, 'called', %s, %s, %s)
+            RETURNING id
+        """, (emp_no, shift_start_time, shift_end_time, employee[1]))
+        
         conn.commit()
+        attendance_id = cursor.fetchone()[0]
+        print(f"Attendance marked successfully for emp_no {emp_no}, record ID: {attendance_id}")
         return True
+        
     except Exception as e:
-        print(f"Error marking attendance: {str(e)}")
-        conn.rollback()
+        print(f"Error marking attendance for emp_no {emp_no}: {str(e)}")
+        if conn:
+            try:
+                conn.rollback()
+            except:
+                pass
         return False
+        
     finally:
-        cursor.close()
-        close_db_connection(conn)
+        if cursor:
+            try:
+                cursor.close()
+            except:
+                pass
+        if conn:
+            close_db_connection(conn)
 
 def mark_leave(emp_no, leave_type):
     """Mark leave record for an employee"""
@@ -256,15 +371,18 @@ def initialize_database():
                 id SERIAL PRIMARY KEY,
                 emp_no VARCHAR(50) REFERENCES employees(emp_no) ON DELETE CASCADE,
                 employee_id VARCHAR(20) REFERENCES employees(id) ON DELETE CASCADE,
+                name VARCHAR(100),
                 company_name VARCHAR(100) REFERENCES companies(company_name) ON DELETE CASCADE,
-                shift_start_time TIME NOT NULL,
-                shift_end_time TIME NOT NULL,
+                shift_start_time TIMESTAMP WITH TIME ZONE,
+                shift_end_time TIMESTAMP WITH TIME ZONE,
+                status VARCHAR(20) DEFAULT 'Active',
+                marked_by VARCHAR(50),
                 total_work_hours INTERVAL,
                 shift_count INTEGER,
                 created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
                 CONSTRAINT valid_shift_times CHECK (
-                    shift_end_time > shift_start_time OR 
+                    shift_end_time IS NULL OR shift_end_time > shift_start_time OR 
                     (shift_end_time < shift_start_time AND 
                      (shift_end_time + INTERVAL '24 hours') > shift_start_time)
                 )

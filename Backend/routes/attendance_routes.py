@@ -1,19 +1,33 @@
 from flask import Blueprint, jsonify, request
 import psycopg2
-from psycopg2 import extras
+from psycopg2 import extras, sql
 import os
-from datetime import datetime, timedelta
+import traceback
+from datetime import datetime, timedelta, time
 from dotenv import load_dotenv
 import jwt
+from models import get_db_connection, close_db_connection, mark_attendance
 
 load_dotenv()
 attendance_bp = Blueprint('attendance', __name__)
+
+# Debug route to test if the blueprint is working
+@attendance_bp.route('/debug', methods=['GET'])
+def debug_route():
+    return jsonify({
+        'message': 'Attendance routes are working!',
+        'current_time': datetime.now().isoformat()
+    }), 200
 
 # Get database URL from environment
 database_url = os.getenv("DATABASE_URL", "postgresql://postgres:Gevindu@localhost:5433/Security-Attendance")
 
 # Assuming SECRET_KEY is defined elsewhere in the code
 SECRET_KEY = os.getenv("SECRET_KEY")
+
+# Default shift times (can be customized)
+DEFAULT_SHIFT_START = time(8, 0)  # 8:00 AM
+DEFAULT_SHIFT_END = time(17, 0)    # 5:00 PM
 
 @attendance_bp.route('/mark', methods=['POST'])
 def mark_attendance():
@@ -41,14 +55,14 @@ def mark_attendance():
         # Add debug logging for the query
         print(f"Executing query with emp_no: {emp_no}")
 
-        # Check if current user is Acting Admin
+        # Check if current user has permission (Admin or Acting Admin)
         db.execute("SELECT role FROM employees WHERE emp_no = %s", (current_user_emp_no,))
         current_user = db.fetchone()
 
-        if not current_user or current_user['role'] != 'Acting Admin':
+        if not current_user or current_user['role'].lower() not in ['admin', 'acting_admin']:
             db.close()
             client.close()
-            return jsonify({'message': 'Only Acting Admin can mark attendance'}), 403
+            return jsonify({'message': 'Only Admin or Acting Admin can mark attendance'}), 403
 
         # Get employee details using emp_no
         db.execute("""
@@ -81,8 +95,8 @@ def mark_attendance():
             employee['emp_no'],
             employee['id'],
             employee['company_name'],
-            checkin.time(),
-            checkout.time()
+            checkin,
+            checkout
         ))
 
         client.commit()
@@ -103,12 +117,89 @@ def mark_attendance():
         traceback.print_exc()
         return jsonify({'message': f'Unexpected error: {str(e)}'}), 500
 
-@attendance_bp.route('/checkin', methods=['POST'])
-def checkin():
+@attendance_bp.route('/records', methods=['GET'])
+def get_attendance_records():
+    try:
+        emp_no = request.args.get('emp_no')
+        if not emp_no:
+            return jsonify({'success': False, 'message': 'emp_no query parameter is required'}), 400
+
+        client = psycopg2.connect(database_url)
+        db = client.cursor(cursor_factory=psycopg2.extras.DictCursor)
+
+        db.execute("""
+            SELECT id, emp_no, shift_start_time, shift_end_time
+            FROM attendance
+            WHERE emp_no = %s
+            ORDER BY shift_start_time DESC
+        """, (emp_no,))
+        records = db.fetchall()
+        db.close()
+        client.close()
+
+        records_list = [
+            {
+                'id': r['id'],
+                'emp_no': r['emp_no'],
+                'shift_start_time': r['shift_start_time'].isoformat() if r['shift_start_time'] else None,
+                'shift_end_time': r['shift_end_time'].isoformat() if r['shift_end_time'] else None,
+                'status': 'IN' if r['shift_end_time'] is None else 'OUT'
+            }
+            for r in records
+        ]
+
+        return jsonify({'success': True, 'records': records_list}), 200
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({'success': False, 'message': f'Error fetching records: {str(e)}'}), 500
+
+
+@attendance_bp.route('/records/<int:record_id>', methods=['PUT'])
+def update_attendance_record(record_id):
     try:
         token = request.headers.get('Authorization')
         if not token:
-            return jsonify({'message': 'Authorization token is missing'}), 401
+            return jsonify({'success': False, 'message': 'Authorization token is missing'}), 401
+        if token.startswith('Bearer '):
+            token = token.split(' ')[1]
+        try:
+            payload = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
+        except jwt.ExpiredSignatureError:
+            return jsonify({'success': False, 'message': 'Token has expired'}), 401
+        except jwt.InvalidTokenError:
+            return jsonify({'success': False, 'message': 'Invalid token'}), 401
+        data = request.get_json()
+        shift_start_time = data.get('shift_start_time')
+        shift_end_time = data.get('shift_end_time')
+        status = data.get('status')
+        client = psycopg2.connect(database_url)
+        db = client.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        db.execute("""
+            UPDATE attendance
+            SET shift_start_time = %s,
+                shift_end_time = %s,
+                status = %s
+            WHERE id = %s
+            RETURNING id, emp_no, shift_start_time, shift_end_time, status
+        """, (shift_start_time, shift_end_time, status, record_id))
+        updated = db.fetchone()
+        client.commit()
+        db.close()
+        client.close()
+        if not updated:
+            return jsonify({'success': False, 'message': 'Record not found'}), 404
+        return jsonify({'success': True, 'record': dict(updated)}), 200
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({'success': False, 'message': f'Error updating record: {str(e)}'}), 500
+
+@attendance_bp.route('/checkin', methods=['POST'])
+def checkin():
+    try:
+        # Verify token
+        token = request.headers.get('Authorization')
+        if not token:
+            return jsonify({'success': False, 'message': 'Authorization token is missing'}), 401
 
         if token.startswith('Bearer '):
             token = token.split(' ')[1]
@@ -117,92 +208,111 @@ def checkin():
             payload = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
             current_user_emp_no = payload.get('emp_no')
         except jwt.ExpiredSignatureError:
-            return jsonify({'message': 'Token has expired'}), 401
+            return jsonify({'success': False, 'message': 'Token has expired'}), 401
         except jwt.InvalidTokenError:
-            return jsonify({'message': 'Invalid token'}), 401
+            return jsonify({'success': False, 'message': 'Invalid token'}), 401
 
+        # Connect to database
         client = psycopg2.connect(database_url)
         db = client.cursor(cursor_factory=psycopg2.extras.DictCursor)
 
         # Check if current user is Acting Admin
         db.execute("SELECT role FROM employees WHERE emp_no = %s", (current_user_emp_no,))
         current_user = db.fetchone()
-        if not current_user or current_user['role'] != 'Acting Admin':
+        # Debug: print the current user and role
+        print(f"[DEBUG] JWT payload: {payload if 'payload' in locals() else 'N/A'}")
+        print(f"[DEBUG] Current user from DB: {current_user}")
+        if not current_user or current_user['role'].lower() not in ['admin', 'acting_admin']:
             db.close()
             client.close()
-            return jsonify({'message': 'Only Acting Admin can mark attendance'}), 403
+            return jsonify({'success': False, 'message': 'Only admin or acting_admin can mark attendance'}), 403
 
-        # Get employee number to mark (from request or current user)
+        # Get employee number to mark
         data = request.get_json() or {}
-        emp_no = data.get('emp_no', current_user_emp_no)
+        emp_no = data.get('emp_no')
+        
+        if not emp_no:
+            db.close()
+            client.close()
+            return jsonify({'success': False, 'message': 'Employee number is required'}), 400
 
-        # Check if user exists
+        # Get employee details
         db.execute("""
             SELECT e.*, c.company_name 
             FROM employees e 
-            JOIN companies c ON e.company_name = c.company_name 
+            LEFT JOIN companies c ON e.company_name = c.company_name 
             WHERE e.emp_no = %s
         """, (emp_no,))
         user = db.fetchone()
         if not user:
             db.close()
             client.close()
-            return jsonify({'message': 'User not found'}), 404
+            return jsonify({'success': False, 'message': 'Employee not found'}), 404
+
+        current_date = datetime.now().date()
+        current_time = datetime.now()
 
         # Check if already checked in today
-        current_date = datetime.now().date()
         db.execute("""
             SELECT * FROM attendance 
-            WHERE emp_no = %s AND date = %s AND checkin_time IS NOT NULL AND checkout_time IS NULL
+            WHERE emp_no = %s AND updated_at::date = %s AND shift_end_time IS NULL
+            ORDER BY shift_start_time DESC
+            LIMIT 1
         """, (emp_no, current_date))
-        existing_attendance = db.fetchone()
         
+        existing_attendance = db.fetchone()
         if existing_attendance:
             db.close()
             client.close()
-            return jsonify({'message': f'User {emp_no} has already checked in today'}), 400
+            return jsonify({
+                'success': False,
+                'message': f'Employee {emp_no} has an active session. Please check out first.'
+            }), 400
 
-        # Mark check-in
-        checkin_time = datetime.now()
-        # Add 8 hours for check-out time
-        checkout_time = checkin_time + timedelta(hours=8)
-        db.execute("""
-            INSERT INTO attendance (
-                emp_no, id, name, company_name, checkin_time, checkout_time, date, status, marked_by
-            ) VALUES (
-                %s, 
-                %s,
-                %s,
-                %s,
-                %s, 
-                %s, 
-                %s, 
-                'Active',
-                %s
-            )
-        """, (
-            emp_no,
-            user['id'],
-            user['name'],
-            user['company_name'],
-            checkin_time,
-            checkout_time,
-            current_date,
-            current_user_emp_no
-        ))
-        
-        client.commit()
-        db.close()
-        client.close()
-
-        return jsonify({
-            'message': 'Check-in successful',
-            'emp_no': emp_no,
-            'name': user['name'],
-            'company_name': user['company_name'],
-            'checkin_time': checkin_time.strftime('%Y-%m-%d %H:%M:%S'),
-            'checkout_time': checkout_time.strftime('%Y-%m-%d %H:%M:%S')
-        }), 200
+        try:
+            # Mark check-in
+            current_time = datetime.now()
+            shift_start_time = current_time  # Use datetime, not .time()
+            shift_end_time = None  # set to NULL in the database
+            db.execute("""
+                INSERT INTO attendance (
+                    emp_no, employee_id, company_name, 
+                    shift_start_time, shift_end_time, updated_at
+                ) VALUES (
+                    %s, %s, %s, 
+                    %s, %s, %s
+                )
+                RETURNING id, shift_start_time, shift_end_time
+            """, (
+                emp_no,
+                user.get('id'),
+                user.get('company_name'),
+                shift_start_time,
+                shift_end_time,
+                current_time
+            ))
+            
+            # Get the inserted record
+            attendance_id = db.fetchone()['id']
+            
+            # Update the checkout time to be 8 hours after check-in
+            client.commit()
+            return jsonify({
+                'success': True,
+                'data': {
+                    'name': user.get('name'),
+                    'checkin_time': shift_start_time.isoformat(),
+                    'checkout_time': None
+                }
+            }), 200
+            
+        except Exception as e:
+            client.rollback()
+            raise e
+            
+        finally:
+            db.close()
+            client.close()
 
     except Exception as e:
         import traceback
@@ -215,7 +325,7 @@ def checkout():
         # Verify token
         token = request.headers.get('Authorization')
         if not token:
-            return jsonify({'message': 'Authorization token is missing'}), 401
+            return jsonify({'success': False, 'message': 'Authorization token is missing'}), 401
 
         if token.startswith('Bearer '):
             token = token.split(' ')[1]
@@ -224,9 +334,9 @@ def checkout():
             payload = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
             current_user_emp_no = payload.get('emp_no')
         except jwt.ExpiredSignatureError:
-            return jsonify({'message': 'Token has expired'}), 401
+            return jsonify({'success': False, 'message': 'Token has expired'}), 401
         except jwt.InvalidTokenError:
-            return jsonify({'message': 'Invalid token'}), 401
+            return jsonify({'success': False, 'message': 'Invalid token'}), 401
 
         # Connect to database
         client = psycopg2.connect(database_url)
@@ -235,86 +345,99 @@ def checkout():
         # Check if current user is Acting Admin
         db.execute("SELECT role FROM employees WHERE emp_no = %s", (current_user_emp_no,))
         current_user = db.fetchone()
-        if not current_user or current_user['role'] != 'Acting Admin':
+        # Debug: print the current user and role
+        print(f"[DEBUG] JWT payload: {payload if 'payload' in locals() else 'N/A'}")
+        print(f"[DEBUG] Current user from DB: {current_user}")
+        if not current_user or current_user['role'].lower() not in ['admin', 'acting_admin']:
             db.close()
             client.close()
-            return jsonify({'message': 'Only Acting Admin can mark attendance'}), 403
+            return jsonify({'success': False, 'message': 'Only admin or acting_admin can mark attendance'}), 403
 
-        # Get employee number to mark (from request or current user)
+        # Get employee number to mark
         data = request.get_json() or {}
-        emp_no = data.get('emp_no', current_user_emp_no)
+        emp_no = data.get('emp_no')
+        
+        if not emp_no:
+            db.close()
+            client.close()
+            return jsonify({'success': False, 'message': 'Employee number is required'}), 400
 
-        # Check if user exists
-        db.execute("SELECT * FROM employees WHERE emp_no = %s", (emp_no,))
+        # Get employee details
+        db.execute("""
+            SELECT e.*, c.company_name 
+            FROM employees e 
+            LEFT JOIN companies c ON e.company_name = c.company_name 
+            WHERE e.emp_no = %s
+        """, (emp_no,))
+        
         user = db.fetchone()
         if not user:
             db.close()
             client.close()
-            return jsonify({'message': 'User not found'}), 404
+            return jsonify({'success': False, 'message': 'Employee not found'}), 404
 
-        # Check for an active check-in today
         current_date = datetime.now().date()
+        current_time = datetime.now()
+
+        # Check if user has an active check-in
         db.execute("""
             SELECT * FROM attendance 
-            WHERE emp_no = %s AND date = %s AND checkin_time IS NOT NULL AND checkout_time IS NULL
+            WHERE emp_no = %s AND updated_at::date = %s AND shift_end_time IS NULL
+            ORDER BY shift_start_time DESC
+            LIMIT 1
         """, (emp_no, current_date))
-        existing_attendance = db.fetchone()
         
-        # Debug logging
-        if not existing_attendance:
-            # Additional query to understand the current state
-            db.execute("""
-                SELECT 
-                    COUNT(*) as total_records,
-                    SUM(CASE WHEN checkin_time IS NOT NULL THEN 1 ELSE 0 END) as checkin_count,
-                    SUM(CASE WHEN checkout_time IS NOT NULL THEN 1 ELSE 0 END) as checkout_count
-                FROM attendance 
-                WHERE emp_no = %s AND date = %s
-            """, (emp_no, current_date))
-            attendance_stats = db.fetchone()
-
-            print(f"Attendance Debug for {emp_no} on {current_date}:")
-            print(f"Total Records: {attendance_stats['total_records']}")
-            print(f"Check-in Count: {attendance_stats['checkin_count']}")
-            print(f"Check-out Count: {attendance_stats['checkout_count']}")
-
+        attendance_record = db.fetchone()
+        if not attendance_record:
             db.close()
             client.close()
             return jsonify({
-                'message': f'No active check-in found for user {emp_no} today',
-                'debug': {
-                    'total_records': attendance_stats['total_records'],
-                    'checkin_count': attendance_stats['checkin_count'],
-                    'checkout_count': attendance_stats['checkout_count']
-                }
+                'success': False,
+                'message': f'No active check-in found for employee {emp_no}'
             }), 400
 
-        # Calculate total hours
-        checkout_time = datetime.now()
-        checkin_time = existing_attendance['checkin_time']
-        total_hours = (checkout_time - checkin_time).total_seconds() / 3600
-        adjusted_hours = min(total_hours, 8.0)  # Cap at 8 hours
+        try:
+            # Calculate work hours
+            shift_start_time = attendance_record['shift_start_time']
+            # Ensure both are datetime, not time
+            if isinstance(shift_start_time, time):
+                # Convert to today's datetime for compatibility (should not happen with new schema)
+                shift_start_time = datetime.combine(current_time.date(), shift_start_time)
+            work_hours = (current_time - shift_start_time).total_seconds() / 3600  # in hours
+            
+            # Update the attendance record with checkout time
+            db.execute("""
+                UPDATE attendance 
+                SET shift_end_time = %s,
 
-        # Update attendance with checkout
-        db.execute("""
-            UPDATE attendance 
-            SET checkout_time = %s, 
-                total_hours = %s, 
-                status = 'Completed',
-                marked_by = %s
-            WHERE emp_no = %s AND date = %s AND checkin_time IS NOT NULL AND checkout_time IS NULL
-        """, (checkout_time, round(adjusted_hours, 2), current_user_emp_no, emp_no, current_date))
-        
-        client.commit()
-        db.close()
-        client.close()
-
-        return jsonify({
-            'message': 'Check-out successful', 
-            'emp_no': emp_no,
-            'checkout_time': checkout_time.strftime('%Y-%m-%d %H:%M:%S'),
-            'total_hours': round(adjusted_hours, 2)
-        }), 200
+                    updated_at = CURRENT_TIMESTAMP,
+                    total_work_hours = %s * INTERVAL '1 hour',
+                    shift_count = CEIL(EXTRACT(EPOCH FROM (%s - shift_start_time)) / (12 * 60 * 60))
+                WHERE id = %s
+                RETURNING *
+            """, (current_time, work_hours, current_time, attendance_record['id']))
+            
+            updated_record = db.fetchone()
+            
+            client.commit()
+            
+            return jsonify({
+                'success': True,
+                'data': {
+                    'name': user.get('name'),
+                    'checkin_time': shift_start_time.isoformat() if shift_start_time else None,
+                    'checkout_time': updated_record['shift_end_time'].isoformat() if updated_record['shift_end_time'] else None,
+                    'total_work_hours': str(updated_record['total_work_hours'])
+                }
+            }), 200
+            
+        except Exception as e:
+            client.rollback()
+            raise e
+            
+        finally:
+            db.close()
+            client.close()
 
     except Exception as e:
         import traceback
@@ -355,10 +478,10 @@ def check_attendance_status():
         # Check current attendance status
         current_date = datetime.now().date()
         db.execute("""
-            SELECT checkin_time, checkout_time, status 
+            SELECT shift_start_time, shift_end_time, status 
             FROM attendance 
             WHERE emp_no = %s AND date = %s
-            ORDER BY checkin_time DESC
+            ORDER BY shift_start_time DESC
             LIMIT 1
         """, (emp_no, current_date))
         attendance_record = db.fetchone()
@@ -374,20 +497,20 @@ def check_attendance_status():
             }), 200
 
         # Determine attendance status
-        if attendance_record['checkin_time'] and not attendance_record['checkout_time']:
+        if attendance_record['shift_start_time'] and not attendance_record['shift_end_time']:
             return jsonify({
                 'message': 'Checked in today',
-                'checkin_time': attendance_record['checkin_time'].strftime('%Y-%m-%d %H:%M:%S'),
+                'shift_start_time': attendance_record['shift_start_time'].strftime('%Y-%m-%d %H:%M:%S'),
                 'can_checkin': False,
                 'can_checkout': True,
                 'status': attendance_record['status']
             }), 200
 
-        if attendance_record['checkin_time'] and attendance_record['checkout_time']:
+        if attendance_record['shift_start_time'] and attendance_record['shift_end_time']:
             return jsonify({
                 'message': 'Checked out today',
-                'checkin_time': attendance_record['checkin_time'].strftime('%Y-%m-%d %H:%M:%S'),
-                'checkout_time': attendance_record['checkout_time'].strftime('%Y-%m-%d %H:%M:%S'),
+                'shift_start_time': attendance_record['shift_start_time'].strftime('%Y-%m-%d %H:%M:%S'),
+                'shift_end_time': attendance_record['shift_end_time'].strftime('%Y-%m-%d %H:%M:%S'),
                 'can_checkin': False,
                 'can_checkout': False,
                 'status': attendance_record['status']

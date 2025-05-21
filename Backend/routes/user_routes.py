@@ -1,82 +1,104 @@
 from flask import Blueprint, request, jsonify
 from flask_cors import cross_origin
-from models import (
-    get_db_connection, close_db_connection, hash_password, verify_password,
-    get_all_employees, get_employees_by_rank, get_employee_by_emp_no
-)
-import jwt
-from datetime import datetime, timedelta
+import psycopg2
+from psycopg2 import extras, errors
+import traceback
 import os
+import traceback
+from datetime import datetime, timedelta
+import jwt
+from models import (
+    get_db_connection, close_db_connection, 
+    hash_password, verify_password,
+    get_all_employees, get_employees_by_rank, 
+    get_employee_by_emp_no
+)
 
 user_bp = Blueprint('user', __name__)
-
 SECRET_KEY = os.getenv('SECRET_KEY', 'your-secret-key-here')
 database_url = os.getenv("DATABASE_URL", "postgresql://postgres:Gevindu@localhost:5433/Security-Attendance")
 
 @user_bp.route('/login', methods=['POST'])
 @cross_origin()
 def login():
+    conn = None
+    cursor = None
     try:
+        # Get request data
         data = request.get_json()
-        print('Login attempt received for emp_no:', data.get('emp_no'))
-        
+        if not data:
+            return jsonify({'message': 'No data provided'}), 400
+            
         emp_no = data.get('emp_no')
         password = data.get('password')
-
+        
+        # Validate input
         if not emp_no or not password:
             return jsonify({'message': 'Employee number and password are required'}), 400
 
-        conn = get_db_connection()
-        cursor = conn.cursor()
-
-        query = """
-            SELECT emp_no, name, role, tel, 
-                   security_firm, rank, password, company_name
-            FROM employees 
-            WHERE emp_no = %s
-        """
-        cursor.execute(query, (emp_no,))
-        employee = cursor.fetchone()
-        cursor.close()
-        close_db_connection(conn)
-
-        if not employee:
-            return jsonify({'message': 'Employee not found or not authorized to log in'}), 404
-
-        if len(employee) < 8:
-            return jsonify({'message': f'Internal error: employee tuple too short ({len(employee)})'}), 500
-
-        if employee[6] is None:
-            return jsonify({'message': 'Internal error: password is None'}), 500
-
-        is_valid = verify_password(employee[6], password)
-        if not is_valid:
-            return jsonify({'message': 'Invalid credentials'}), 401
-
-        role = employee[2].strip().lower() if employee[2] else ''
-        if role not in ['admin', 'acting admin', 'user']:
-            return jsonify({'message': 'Role must be either admin, Acting Admin, or user', 'role': employee[2]}), 403
-
-        token = jwt.encode({
-            'emp_no': employee[0],
-            'role': employee[2],
-            'rank': employee[5],
-            'exp': datetime.utcnow() + timedelta(hours=24)
-        }, SECRET_KEY, algorithm='HS256')
-
-        response_data = {
-            'token': token,
-            'role': employee[2],
-            'rank': employee[5],
-            'name': employee[1],
-            'emp_no': employee[0],
-            'company_name': employee[7]
-        }
-        return jsonify(response_data), 200
-
+        # Get database connection
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor(cursor_factory=extras.DictCursor)
+            
+            # Query employee
+            query = """
+                SELECT emp_no, name, role, tel, 
+                       security_firm, rank, password, company_name
+                FROM employees 
+                WHERE emp_no = %s
+            """
+            cursor.execute(query, (emp_no,))
+            employee = cursor.fetchone()
+            
+            if not employee:
+                return jsonify({'message': 'Invalid credentials'}), 401
+                
+            # Verify password
+            if not employee.get('password'):
+                return jsonify({'message': 'Authentication error'}), 500
+                
+            if not verify_password(employee['password'], password):
+                return jsonify({'message': 'Invalid credentials'}), 401
+                
+            # Prepare user data
+            user_data = {
+                'emp_no': employee['emp_no'],
+                'name': employee['name'],
+                'role': employee['role'],
+                'rank': employee.get('rank', ''),
+                'company_name': employee.get('company_name', '')
+            }
+            
+            # Generate token
+            token = jwt.encode({
+                'emp_no': employee['emp_no'],
+                'role': employee['role'],
+                'exp': datetime.utcnow() + timedelta(hours=24)
+            }, SECRET_KEY, algorithm='HS256')
+            
+            return jsonify({
+                'message': 'Login successful',
+                'token': token,
+                'user': user_data
+            }), 200
+            
+        except Exception as e:
+            print(f"Error during login: {str(e)}")
+            print(traceback.format_exc())
+            return jsonify({'message': 'Authentication failed'}), 500
+            
     except Exception as e:
-        import traceback
-        return jsonify({'message': f'Error during login: {str(e)}', 'trace': traceback.format_exc()}), 500
+        print(f"Unexpected error in login: {str(e)}")
+        print(traceback.format_exc())
+        return jsonify({'message': 'An unexpected error occurred'}), 500
+        
+    finally:
+        # Clean up resources
+        if cursor:
+            cursor.close()
+        if conn:
+            close_db_connection(conn)
 
 @user_bp.route('/employees_by_rank', methods=['GET'])
 @cross_origin()
@@ -96,115 +118,232 @@ def employees_by_rank():
 @user_bp.route('/employee/<string:emp_no>', methods=['GET'])
 @cross_origin()
 def get_employee(emp_no):
+    conn = None
+    cursor = None
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        print(f"Received request for employee: {emp_no}")
         
-        query = """
-            SELECT e.*, c.company_name 
-            FROM employees e 
-            JOIN companies c ON e.company_name = c.company_name 
-            WHERE e.emp_no = %s
-        """
-        cursor.execute(query, (emp_no,))
-        employee = cursor.fetchone()
-        cursor.close()
-        close_db_connection(conn)
-        
-        if not employee:
-            return jsonify({'message': 'Employee not found'}), 404
+        # Validate input
+        if not emp_no:
+            print("Error: Employee number is required")
+            return jsonify({'message': 'Employee number is required'}), 400
             
-        return jsonify(dict(employee)), 200
+        # Get database connection
+        try:
+            print("Getting database connection...")
+            conn = get_db_connection()
+            cursor = conn.cursor(cursor_factory=extras.DictCursor)
+            
+            # First, check if the employee exists
+            cursor.execute("SELECT 1 FROM employees WHERE emp_no = %s", (emp_no,))
+            if not cursor.fetchone():
+                print(f"Employee {emp_no} not found")
+                return jsonify({'message': 'Employee not found'}), 404
+            
+            print("Querying employee details...")
+            try:
+                # Query employee details with a simpler query first
+                query = """
+                    SELECT emp_no, name, role, tel, 
+                           security_firm, rank, company_name
+                    FROM employees
+                    WHERE emp_no = %s
+                """
+                print(f"Executing query: {query} with emp_no={emp_no}")
+                cursor.execute(query, (emp_no,))
+                employee = cursor.fetchone()
+                
+                if not employee:
+                    print("No employee data found after successful existence check")
+                    return jsonify({'message': 'Employee data not found'}), 404
+                
+                print(f"Employee data: {employee}")
+                
+                # Get company name separately to avoid JOIN issues
+                company_name = employee.get('company_name')
+                company_display_name = None
+                
+                if company_name:
+                    print(f"Looking up company: {company_name}")
+                    try:
+                        cursor.execute("SELECT company_name FROM companies WHERE company_name = %s", (company_name,))
+                        company = cursor.fetchone()
+                        if company:
+                            company_display_name = company['company_name']
+                            print(f"Found company: {company_display_name}")
+                        else:
+                            print(f"Company not found: {company_name}")
+                    except Exception as e:
+                        print(f"Error looking up company: {str(e)}")
+                        print(traceback.format_exc())
+                else:
+                    print("No company name associated with employee")
+                
+                # Build response with safe attribute access
+                employee_data = {
+                    'emp_no': employee.get('emp_no'),
+                    'name': employee.get('name'),
+                    'role': employee.get('role'),
+                    'tel': employee.get('tel'),
+                    'security_firm': employee.get('security_firm'),
+                    'rank': employee.get('rank'),
+                    'company_name': company_name,
+                    'company_display_name': company_display_name
+                }
+                print(f"Built employee data: {employee_data}")
+                
+            except Exception as e:
+                print(f"Error in employee data processing: {str(e)}")
+                print(traceback.format_exc())
+                return jsonify({
+                    'message': 'Error processing employee data',
+                    'error': str(e),
+                    'type': type(e).__name__
+                }), 500
+            
+            print(f"Successfully retrieved employee: {employee_data}")
+            return jsonify({
+                'message': 'Employee details retrieved successfully',
+                'employee': employee_data
+            })
+            
+        except Exception as e:
+            error_msg = f"Error retrieving employee: {str(e)}"
+            print(error_msg)
+            print(traceback.format_exc())
+            return jsonify({
+                'message': 'Error retrieving employee details',
+                'error': error_msg,
+                'type': type(e).__name__
+            }), 500
+            
     except Exception as e:
-        return jsonify({'message': f'Error retrieving employee: {str(e)}'}), 500
+        error_msg = f"Unexpected error in get_employee: {str(e)}"
+        print(error_msg)
+        print(traceback.format_exc())
+        return jsonify({
+            'message': 'An unexpected error occurred',
+            'error': error_msg,
+            'type': type(e).__name__
+        }), 500
+        
+    finally:
+        # Clean up resources
+        try:
+            if cursor:
+                cursor.close()
+            if conn:
+                close_db_connection(conn)
+        except Exception as e:
+            print(f"Error cleaning up resources: {str(e)}")
 
 @user_bp.route('/employee/add', methods=['POST'])
 @cross_origin()
 def add_employee():
+    conn = None
+    cursor = None
+    
     try:
+        # Get and validate request data
         data = request.get_json()
+        if not data:
+            return jsonify({'message': 'No data provided'}), 400
+            
+        # Required fields
+        required_fields = [
+            'emp_no', 'name', 'role', 'tel', 
+            'security_firm', 'rank', 'company_name', 
+            'nic', 'password'
+        ]
         
-        # Validate required fields
-        required_fields = ['emp_no', 'id', 'name', 'role', 'tel', 'company_name', 'security_firm', 'rank', 'password', 'nic']
-        if not all(field in data for field in required_fields):
-            return jsonify({'message': 'All fields are required'}), 400
-
-        # Get database connection and cursor
+        # Check for missing fields
+        missing_fields = [field for field in required_fields if field not in data or not data[field]]
+        if missing_fields:
+            return jsonify({
+                'message': 'Missing required fields',
+                'missing_fields': missing_fields
+            }), 400
+            
+        # Get database connection
         conn = get_db_connection()
-        cursor = conn.cursor()
-
-        # Check if company exists and create if it doesn't
-        cursor.execute("""
-            SELECT 1 FROM companies WHERE company_name = %s
-        """, (data['company_name'],))
-        
-        if not cursor.fetchone():
-            # Create the company
-            cursor.execute("""
-                INSERT INTO companies (company_name, address, subsidiary, contact_number)
-                VALUES (%s, %s, %s, %s)
-            """, (
-                data['company_name'],
-                data.get('address', None),
-                data['security_firm'],
-                data['tel']
-            ))
+        cursor = conn.cursor(cursor_factory=extras.DictCursor)
         
         # Check if employee already exists
         cursor.execute("""
-            SELECT 1 FROM employees WHERE emp_no = %s
-        """, (data['emp_no'],))
+            SELECT emp_no, nic 
+            FROM employees 
+            WHERE emp_no = %s OR nic = %s
+        """, (data['emp_no'], data['nic']))
         
-        if cursor.fetchone():
-            cursor.close()
-            close_db_connection(conn)
-            return jsonify({'message': 'Employee already exists'}), 400
-
-        # Hash the password
+        existing = cursor.fetchone()
+        if existing:
+            return jsonify({
+                'message': 'Employee already exists',
+                'conflict': 'employee_number' if existing['emp_no'] == data['emp_no'] else 'nic'
+            }), 409
+        
+        # Hash password
         hashed_password = hash_password(data['password'])
-
+        
         # Insert new employee
-        cursor.execute("""
+        query = """
             INSERT INTO employees (
-                emp_no, id, rank, name, tel, company_name, 
-                address, nic, password, security_firm, role
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        """, (
+                emp_no, name, role, tel, security_firm, 
+                rank, company_name, nic, password
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING emp_no, name, role, tel, security_firm, 
+                      rank, company_name, nic
+        """
+        
+        cursor.execute(query, (
             data['emp_no'],
-            data['id'],
-            data['rank'],
             data['name'],
+            data['role'],
             data['tel'],
-            data['company_name'],
-            data.get('address', None),
-            data['nic'],
-            hashed_password,
             data['security_firm'],
-            data['role']
+            data['rank'],
+            data['company_name'],
+            data['nic'],
+            hashed_password
         ))
         
+        # Get the newly created employee
+        new_employee = cursor.fetchone()
         conn.commit()
-        cursor.close()
-        close_db_connection(conn)
+        
+        # Prepare response
+        employee_data = {
+            'emp_no': new_employee['emp_no'],
+            'name': new_employee['name'],
+            'role': new_employee['role'],
+            'tel': new_employee['tel'],
+            'security_firm': new_employee['security_firm'],
+            'rank': new_employee['rank'],
+            'company_name': new_employee['company_name'],
+            'nic': new_employee['nic']
+        }
         
         return jsonify({
-            'message': 'Employee added successfully', 
-            'emp_no': data['emp_no']
+            'message': 'Employee added successfully',
+            'employee': employee_data
         }), 201
-
-    except Exception as e:
-        if 'conn' in locals():
-            try:
-                cursor.close()
-            except:
-                pass
-            try:
-                close_db_connection(conn)
-            except:
-                pass
         
-        print(f"Error adding employee: {e}")
-        return jsonify({'message': f'Error occurred: {str(e)}'}), 500
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        print(f"Error adding employee: {str(e)}")
+        print(traceback.format_exc())
+        return jsonify({
+            'message': 'Error adding employee',
+            'error': str(e)
+        }), 500
+        
+    finally:
+        # Clean up resources
+        if cursor:
+            cursor.close()
+        if conn:
+            close_db_connection(conn)
 
 @user_bp.route('/employee/<emp_no>', methods=['GET'])
 @cross_origin()
