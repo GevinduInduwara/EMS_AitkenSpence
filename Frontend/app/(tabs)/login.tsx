@@ -22,71 +22,101 @@ const LoginPage: React.FC = () => {
     setEmployeeNoError(false);
     setPasswordError(false);
 
-    // Validate inputs
-    let isValid = true;
-
-    if (employeeNo.trim() === '') {
-      setEmployeeNoError(true);
-      isValid = false;
-    }
-    if (password.trim() === '') {
-      setPasswordError(true);
-      isValid = false;
-    }
-
-    if (!isValid) {
-      Alert.alert(
-        'Validation Error', 
-        'Please fill in all required fields.',
-        [{ text: 'OK' }]
-      );
-      return;
-    }
-
     try {
-      const response = await axios.post(getApiUrl() + '/api/login', {
-        emp_no: employeeNo.trim(),
-        password: password
-      }, {  
-        headers: { 'Content-Type': 'application/json' },
-        timeout: 10000,  // Increased timeout (10 seconds)
-      });
+      // Validate inputs
+      let isValid = true;
 
-      // Store authentication details securely
-      await SecureStore.setItemAsync('userToken', String(response.data.token));
-      await SecureStore.setItemAsync('userRole', String(response.data.role));
-      await SecureStore.setItemAsync('userRank', String(response.data.rank));
-      await SecureStore.setItemAsync('userName', String(response.data.name));
-      await SecureStore.setItemAsync('userEmpNo', String(response.data.emp_no));
+      if (employeeNo.trim() === '') {
+        setEmployeeNoError(true);
+        isValid = false;
+      }
+      if (password.trim() === '') {
+        setPasswordError(true);
+        isValid = false;
+      }
 
-      // Navigate to home page
-      router.push('/home');
+      if (!isValid) {
+        throw new Error('Please fill in all required fields.');
+      }
 
-    } catch (error: unknown) {
+      console.log('Attempting to log in to:', getApiUrl() + '/api/login');
+      
+      const response = await axios.post(
+        getApiUrl() + '/api/login',
+        {
+          emp_no: employeeNo.trim(),
+          password: password
+        },
+        {
+          headers: { 
+            'Content-Type': 'application/json',
+            'Accept': 'application/json'
+          },
+          timeout: 15000,  // 15 seconds timeout
+          validateStatus: (status) => status < 500  // Handle 4xx responses as well
+        }
+      );
+
+      console.log('Login response:', response.status, response.data);
+
+      if (response.data && response.data.token) {
+        // Store authentication details securely
+        await Promise.all([
+          SecureStore.setItemAsync('userToken', String(response.data.token)),
+          SecureStore.setItemAsync('userRole', String(response.data.role || '')),
+          SecureStore.setItemAsync('userRank', String(response.data.rank || '')),
+          SecureStore.setItemAsync('userName', String(response.data.name || '')),
+          SecureStore.setItemAsync('userEmpNo', String(response.data.emp_no || ''))
+        ]);
+
+        // Navigate to home page
+        router.replace('/home');
+      } else {
+        throw new Error('Invalid response from server');
+      }
+
+    } catch (error: any) {
       console.error('Login error:', error);
       
       let errorMessage = 'Login failed. Please check your internet connection and try again.';
+      let title = 'Login Failed';
 
-      if (error instanceof Error) {
-        errorMessage = error.message || errorMessage;
-      } else if (typeof error === 'object' && error !== null && 'response' in error) {
-        const axiosError = error as { response: { data: { message: string } } };
-        const responseMessage = axiosError.response?.data.message;
+      if (error.message === 'Please fill in all required fields.') {
+        title = 'Validation Error';
+        errorMessage = error.message;
+      } else if (error.code === 'ECONNABORTED') {
+        errorMessage = 'Request timed out. Please check your internet connection.';
+      } else if (error.response) {
+        // The request was made and the server responded with a status code
+        // that falls out of the range of 2xx
+        const { status, data } = error.response;
+        console.error('Error response:', status, data);
         
-        switch (responseMessage) {
-          case 'Employee not found or not authorized to log in':
-            errorMessage = 'Access denied. Only OIC rank employees can log in to the system.';
-            break;
-          case 'Invalid credentials':
-            errorMessage = 'Incorrect password. Please try again.';
-            break;
-          default:
-            errorMessage = 'Login failed. Please check your credentials and try again.';
+        if (status === 401) {
+          errorMessage = data.message === 'Invalid credentials' 
+            ? 'Incorrect password. Please try again.'
+            : 'Invalid employee number or password.';
+        } else if (status === 403) {
+          errorMessage = 'Access denied. You do not have permission to log in.';
+        } else if (status === 404) {
+          errorMessage = 'Employee not found. Please check your employee number.';
+        } else if (status >= 500) {
+          errorMessage = 'Server error. Please try again later.';
+        } else {
+          errorMessage = data.message || 'An unexpected error occurred. Please try again.';
         }
+      } else if (error.request) {
+        // The request was made but no response was received
+        console.error('No response received:', error.request);
+        errorMessage = 'Could not connect to the server. Please check your internet connection.';
+      } else if (error.message) {
+        // Something happened in setting up the request that triggered an Error
+        console.error('Request setup error:', error.message);
+        errorMessage = `Error: ${error.message}`;
       }
 
       Alert.alert(
-        'Login Failed',
+        title,
         errorMessage,
         [{ text: 'OK' }]
       );

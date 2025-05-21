@@ -16,6 +16,11 @@ interface TranslationKeys {
   markAttendance: string;
   checkAttendance: string;
   userRegistration: string;
+  markAttendanceTitle: string;
+  submit: string;
+  employeeId: string;
+  rank: string;
+  back: string;
 }
 
 type LanguageCode = 'en' | 'si';
@@ -28,7 +33,12 @@ const translations: Record<LanguageCode, TranslationKeys> = {
     getStarted: 'Get Started',
     markAttendance: 'Mark Attendance',
     checkAttendance: 'Check Attendance',
-    userRegistration: 'User Registration'
+    userRegistration: 'User Registration',
+    markAttendanceTitle: 'Select Employee',
+    submit: 'Submit',
+    employeeId: 'Employee ID',
+    rank: 'Rank',
+    back: 'Back'
   },
   si: {
     welcome: 'සාදරයෙන් සාදරයෙන්',
@@ -38,6 +48,11 @@ const translations: Record<LanguageCode, TranslationKeys> = {
     userRegistration: 'යුසර් ලියාපදිංචි කිරීම',
     securityManagementSystem: 'රක්ෂාව කාර්ය පද්ධතිය',
     getStarted: 'ආරම්භ කරන්න',
+    markAttendanceTitle: 'සිටින් තෝරා ගන්න',
+    submit: 'සාර්ථක කරන්න',
+    employeeId: 'සේවක අංකය',
+    rank: 'තනතුර',
+    back: 'ආපසු',
     // Add more Sinhala translations here
   }
 };
@@ -45,10 +60,17 @@ const translations: Record<LanguageCode, TranslationKeys> = {
 export const LanguageProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [language, setLanguage] = useState<string>('en');
 
-  // Translation function
-  const t = (key: keyof TranslationKeys): string => {
+  // Memoize the translation function to prevent unnecessary re-renders
+  const t = React.useCallback((key: keyof TranslationKeys): string => {
     return translations[language as LanguageCode]?.[key] || key;
-  };
+  }, [language]);
+
+  // Create a memoized context value to prevent unnecessary re-renders
+  const contextValue = React.useMemo(() => ({
+    language,
+    setLanguage,
+    t,
+  }), [language, t]);
 
   useEffect(() => {
     // Load language from storage or defaults
@@ -66,7 +88,7 @@ export const LanguageProvider: React.FC<{ children: React.ReactNode }> = ({ chil
   }, []);
 
   return (
-    <LanguageContext.Provider value={{ language, setLanguage, t }}>
+    <LanguageContext.Provider value={contextValue}>
       {children}
     </LanguageContext.Provider>
   );
