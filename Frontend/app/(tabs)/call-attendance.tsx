@@ -7,15 +7,17 @@ import {
   ActivityIndicator,
   Alert,
 } from 'react-native';
-import { ThemedText } from '../../components/ThemedText';
-import { ThemedView } from '../../components/ThemedView';
-import { useLocalSearchParams, useRouter } from 'expo-router';
+import { format } from 'date-fns';
+import { useRouter } from 'expo-router';
 import { useLanguage } from '../../context/LanguageContext';
+import { useLocalSearchParams } from 'expo-router';
 import { getApiUrl } from '../../config/api';
 import * as SecureStore from 'expo-secure-store';
 import axios from 'axios';
-import { format } from 'date-fns';
+import DateTimePicker, { DateTimePickerEvent } from '@react-native-community/datetimepicker';
 import UpdateAttendanceForm from './UpdateAttendanceForm';
+import { ThemedText } from '../../components/ThemedText';
+import { ThemedView } from '../../components/ThemedView';
 
 interface EmployeeData {
   employeeId: string;
@@ -35,12 +37,26 @@ interface AttendanceRecord {
   status: string;
 }
 
-const CallAttendancePage: FC = () => {
-  const [editModalVisible, setEditModalVisible] = useState(false);
-  const [selectedRecord, setSelectedRecord] = useState<AttendanceRecord | null>(null);
+function formatCustomDate(date: Date): string {
+  const yyyy = date.getFullYear();
+  const mm = String(date.getMonth() + 1).padStart(2, '0');
+  const dd = String(date.getDate()).padStart(2, '0');
+  return `${yyyy}-${mm}-${dd}`;
+}
 
+const CallAttendancePage: FC = () => {
   const router = useRouter();
   const { t } = useLanguage();
+
+  const [isLoading, setIsLoading] = useState(true);
+  const [employeeData, setEmployeeData] = useState<EmployeeData | null>(null);
+  const [attendanceRecords, setAttendanceRecords] = useState<AttendanceRecord[]>([]);
+  const [recordsLoading, setRecordsLoading] = useState(false);
+  const [dateFilter, setDateFilter] = useState('today');
+  const [customDate, setCustomDate] = useState<Date | null>(null);
+  const [editModalVisible, setEditModalVisible] = useState(false);
+  const [selectedRecord, setSelectedRecord] = useState<AttendanceRecord | null>(null);
+  const [showCustomPicker, setShowCustomPicker] = useState(false);
 
   const { employeeId, employeeName, rank } = useLocalSearchParams<{
     employeeId: string;
@@ -48,46 +64,27 @@ const CallAttendancePage: FC = () => {
     rank: string;
   }>();
 
-  const [employeeData, setEmployeeData] = useState<EmployeeData | null>(null);
-  const [isLoading, setIsLoading] = useState(true);
-  const [records, setRecords] = useState<AttendanceRecord[]>([]);
-  const [recordsLoading, setRecordsLoading] = useState(false);
-
   const fetchEmployeeDetails = async (empId: string) => {
     if (!empId) return;
-    
+
     setIsLoading(true);
     try {
       const token = await SecureStore.getItemAsync('userToken');
       if (!token) {
-        console.error('No authentication token found');
-        // Instead of redirecting, show an error and allow the user to log in from the current screen
         Alert.alert(
           'Session Expired',
           'Your session has expired. Please log in again.',
-          [
-            {
-              text: 'OK',
-              onPress: () => router.replace('/login')
-            }
-          ]
+          [{ text: 'OK', onPress: () => router.replace('/login') }]
         );
         return;
       }
 
-      const response = await axios.get(
-        `${getApiUrl('/api/employee')}/${empId}`,
-        {
-          headers: {
-            Authorization: `Bearer ${token}`,
-          },
-        }
-      );
+      const response = await axios.get(`${getApiUrl('/api/employee')}/${empId}`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
 
       if (response.data) {
-        // Ensure employeeId is set from emp_no if available, otherwise use the provided empId
         const empNo = response.data.emp_no || empId;
-        console.log('Employee data received:', response.data);
         setEmployeeData({
           employeeId: empNo,
           rank: response.data.rank || rank || 'N/A',
@@ -99,36 +96,18 @@ const CallAttendancePage: FC = () => {
         });
       }
     } catch (error: any) {
-      console.error('Error fetching employee details:', error);
-      
-      // Handle 401 Unauthorized
       if (error.response?.status === 401) {
         Alert.alert(
           'Session Expired',
           'Your session has expired. Please log in again.',
-          [
-            {
-              text: 'OK',
-              onPress: () => router.replace('/login')
-            }
-          ]
+          [{ text: 'OK', onPress: () => router.replace('/login') }]
         );
         return;
       }
-      
-      // If there's an error but we have basic info, still show that
       if (employeeName) {
-        setEmployeeData({
-          employeeId: empId,
-          rank: rank || 'N/A',
-          name: employeeName,
-        });
+        setEmployeeData({ employeeId: empId, rank: rank || 'N/A', name: employeeName });
       } else {
-        Alert.alert(
-          'Error',
-          'Failed to load employee details. Please try again.',
-          [{ text: 'OK' }]
-        );
+        Alert.alert('Error', 'Failed to load employee details. Please try again.', [{ text: 'OK' }]);
         router.back();
       }
     } finally {
@@ -141,49 +120,33 @@ const CallAttendancePage: FC = () => {
       router.back();
       return;
     }
-
-    // If we have the name from the params, use it immediately
     if (employeeName) {
-      setEmployeeData({
-        employeeId,
-        rank,
-        name: employeeName,
-      });
+      setEmployeeData({ employeeId, rank, name: employeeName });
     }
-
-    // Fetch full employee details
     fetchEmployeeDetails(employeeId);
   }, [employeeId, rank, router, employeeName]);
 
-  // Fetch attendance records for the employee
-  const fetchAttendanceRecords = async (empNo: string) => {
+  const fetchAttendanceRecords = async (empNo: string, filter: string = dateFilter) => {
     setRecordsLoading(true);
     try {
       const token = await SecureStore.getItemAsync('userToken');
       if (!token) return;
       const response = await axios.get(
-        `${getApiUrl('/api/attendance/records')}?emp_no=${empNo}`,
-        {
-          headers: { Authorization: `Bearer ${token}` },
-        }
+        `${getApiUrl('/api/attendance/records')}?emp_no=${empNo}&date_filter=${encodeURIComponent(filter)}`,
+        { headers: { Authorization: `Bearer ${token}` } }
       );
-      if (response.data.success) {
-        setRecords(response.data.records);
-      } else {
-        setRecords([]);
-      }
-    } catch (e) {
-      setRecords([]);
+      if (response.data.success) setAttendanceRecords(response.data.records);
+      else setAttendanceRecords([]);
+    } catch {
+      setAttendanceRecords([]);
     } finally {
       setRecordsLoading(false);
     }
   };
 
   useEffect(() => {
-    if (employeeData?.employeeId) {
-      fetchAttendanceRecords(employeeData.employeeId);
-    }
-  }, [employeeData?.employeeId]);
+    if (employeeData?.employeeId) fetchAttendanceRecords(employeeData.employeeId, dateFilter);
+  }, [employeeData?.employeeId, dateFilter]);
 
   const handleBack = () => {
     router.back();
@@ -194,313 +157,376 @@ const CallAttendancePage: FC = () => {
       Alert.alert('Error', 'No employee data found');
       return;
     }
-
     try {
       const token = await SecureStore.getItemAsync('userToken');
       if (!token) {
-        Alert.alert(
-          'Session Expired',
-          'Your session has expired. Please log in again.',
-          [
-            {
-              text: 'OK',
-              onPress: () => router.replace('/login')
-            }
-          ]
-        );
+        Alert.alert('Session Expired', 'Your session has expired. Please log in again.', [
+          { text: 'OK', onPress: () => router.replace('/login') },
+        ]);
         return;
       }
-
-      const endpointUrl = status === 'IN'
-        ? getApiUrl('/api/attendance/checkin')
-        : getApiUrl('/api/attendance/checkout');
+      const endpointUrl =
+        status === 'IN' ? getApiUrl('/api/attendance/checkin') : getApiUrl('/api/attendance/checkout');
       const response = await axios.post(
         endpointUrl,
         { emp_no: employeeData.employeeId },
-        {
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${token}`
-          },
-          timeout: 10000 // 10 seconds timeout
-        }
+        { headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` }, timeout: 10000 }
       );
 
       if (response.data.success) {
-        const message = status === 'IN' 
-          ? `Successfully checked in ${response.data.data?.name || employeeData.name}`
-          : `Successfully checked out ${response.data.data?.name || employeeData.name}`;
-        
-        // Show detailed success message
         const details = response.data.data || {};
-        const detailMessage = status === 'IN'
-          ? `Check-in time: ${details.checkin_time}\n` +
-            `Scheduled check-out: ${details.checkout_time}`
-          : `Check-in time: ${details.checkin_time}\n` +
-            `Check-out time: ${details.checkout_time}\n` +
-            `Total work hours: ${details.total_work_hours}`;
-        
-        Alert.alert(
-          'Success',
-          `${message}\n\n${detailMessage}`,
-          [{ text: 'OK' }],
-          { cancelable: false }
-        );
-        
-        // Refresh employee details to update the status
+        const message =
+          status === 'IN'
+            ? `Successfully checked in ${details.name || employeeData.name}`
+            : `Successfully checked out ${details.name || employeeData.name}`;
+        const detailMessage =
+          status === 'IN'
+            ? `Check-in time: ${details.checkin_time}\nScheduled check-out: ${details.checkout_time}`
+            : `Check-in time: ${details.checkin_time}\nCheck-out time: ${details.checkout_time}\nTotal work hours: ${details.total_work_hours}`;
+        Alert.alert('Success', `${message}\n\n${detailMessage}`, [{ text: 'OK' }], { cancelable: false });
         fetchEmployeeDetails(employeeData.employeeId);
         fetchAttendanceRecords(employeeData.employeeId);
-      } else {
-        throw new Error(response.data.message || 'Failed to process attendance');
-      }
+      } else throw new Error(response.data.message || 'Failed to process attendance');
     } catch (error: any) {
-      console.error(`Error marking ${status}:`, error);
       let errorMessage = `Failed to mark ${status}. Please try again.`;
-      
-      if (error.response) {
-        errorMessage = error.response.data?.message || errorMessage;
-      } else if (error.request) {
-        errorMessage = 'No response from server. Please check your connection.';
-      } else {
-        errorMessage = error.message || errorMessage;
-      }
-      
+      if (error.response) errorMessage = error.response.data?.message || errorMessage;
+      else if (error.request) errorMessage = 'No response from server. Please check your connection.';
+      else errorMessage = error.message || errorMessage;
       Alert.alert('Error', errorMessage);
     }
   };
 
-  const handleInPress = () => {
-    markAttendance('IN');
-  };
-
-  const handleOutPress = () => {
-    markAttendance('OUT');
-  };
-
-  if (isLoading) {
+  if (isLoading)
     return (
       <ThemedView style={[styles.container, styles.loadingContainer]}>
         <ActivityIndicator size="large" color="#007AFF" />
       </ThemedView>
     );
-  }
 
   return (
     <ThemedView style={styles.container}>
       <View style={styles.content}>
+        {/* Profile Card */}
         <View style={styles.card}>
           <View style={styles.profilePlaceholder}>
-            <ThemedText style={styles.placeholderText}>
-              {employeeData?.name?.charAt(0).toUpperCase() || 'E'}
-            </ThemedText>
+            <ThemedText style={styles.placeholderText}>{employeeData?.name?.charAt(0).toUpperCase() || 'E'}</ThemedText>
           </View>
-
           <ThemedText style={styles.name}>{employeeData?.name || 'Employee'}</ThemedText>
           <ThemedText style={styles.subtext}>ID: {employeeData?.employeeId || 'N/A'}</ThemedText>
-
           <View style={styles.rankBadge}>
             <ThemedText style={styles.rankBadgeText}>{employeeData?.rank || 'N/A'}</ThemedText>
           </View>
-
           <View style={styles.buttonRow}>
-            <TouchableOpacity style={styles.inButton} onPress={handleInPress}>
+            <TouchableOpacity style={styles.inButton} onPress={() => markAttendance('IN')}>
               <ThemedText style={styles.buttonText}>IN</ThemedText>
             </TouchableOpacity>
-            <TouchableOpacity style={styles.outButton} onPress={handleOutPress}>
+            <TouchableOpacity style={styles.outButton} onPress={() => markAttendance('OUT')}>
               <ThemedText style={styles.buttonText}>OUT</ThemedText>
             </TouchableOpacity>
           </View>
         </View>
 
-        <ThemedText style={styles.previousTitle}>Previous Records</ThemedText>
-        {recordsLoading ? (
-          <ActivityIndicator size="small" color="#007AFF" />
-        ) : records.length === 0 ? (
-          <View style={styles.recordBox}>
-            <ThemedText style={styles.recordText}>No previous records found.</ThemedText>
-          </View>
-        ) : (
-          <ScrollView style={styles.recordList}>
-            {records.map((rec) => (
+        {/* Date Filter Buttons */}
+        <View style={styles.dateFilterRow}>
+          {['today', 'yesterday', 'custom'].map((filter) => (
               <TouchableOpacity
-                key={rec.id}
-                style={styles.recordBox}
+                key={filter}
+                style={[
+                  styles.dateFilterButton,
+                  (dateFilter === filter || (filter === 'custom' && !['today', 'yesterday'].includes(dateFilter))) && styles.dateFilterButtonActive,
+                ]}
                 onPress={() => {
-                  setSelectedRecord(rec);
-                  setEditModalVisible(true);
+                  if (filter === 'custom') setShowCustomPicker(true);
+                  else {
+                    setDateFilter(filter);
+                    setCustomDate(null);
+                  }
                 }}
               >
-                <ThemedText style={styles.recordText}>
-                  ID: {rec.id} | shift_start_time: {String(rec.shift_start_time)} | shift_end_time: {String(rec.shift_end_time)} | Status: {rec.status}
+                <ThemedText
+                  style={[
+                    styles.dateFilterText,
+                    (dateFilter === filter || (filter === 'custom' && !['today', 'yesterday'].includes(dateFilter))) && styles.dateFilterTextActive,
+                  ]}
+                >
+                  {filter === 'custom' && customDate
+                    ? formatCustomDate(customDate)
+                    : filter.charAt(0).toUpperCase() + filter.slice(1)}
                 </ThemedText>
               </TouchableOpacity>
             ))}
+        </View>
 
-            <UpdateAttendanceForm
-              visible={editModalVisible}
-              initialRecord={selectedRecord}
-              onClose={() => setEditModalVisible(false)}
-              onSave={async (updated) => {
-                if (!selectedRecord) return;
-                try {
-                  const token = await SecureStore.getItemAsync('userToken');
-                  await axios.put(
-                    `${getApiUrl('/api/attendance/records')}/${selectedRecord.id}`,
-                    updated,
-                    { headers: { Authorization: `Bearer ${token}` } }
-                  );
-                  setEditModalVisible(false);
-                  setSelectedRecord(null);
-                  if (employeeData) {
-                    fetchAttendanceRecords(employeeData.employeeId);
-                  }
-                } catch (e) {
-                  Alert.alert('Error', 'Failed to update record');
-                }
-              }}
-            />
-          </ScrollView>
+        {showCustomPicker && (
+          <DateTimePicker
+            value={customDate || new Date()}
+            mode="date"
+            display="default"
+            onChange={(_event: DateTimePickerEvent, selectedDate?: Date) => {
+              setShowCustomPicker(false);
+              if (selectedDate) {
+                setCustomDate(selectedDate);
+                setDateFilter(formatCustomDate(selectedDate));
+              }
+            }}
+          />
         )}
 
+        {/* Attendance List */}
+        {/* <View style={styles.attendanceList}>
+          {attendanceRecords.map((record) => (
+            <View key={record.id} style={styles.attendanceItem}>
+              <ThemedText style={styles.timeText}>{record.shift_start_time}</ThemedText>
+              <ThemedText style={styles.statusText}>{record.status}</ThemedText>
+            </View>
+          ))}
+        </View> */}
+
+        {/* Previous Records Section */}
+        <ThemedText style={styles.previousTitle}>Previous Records</ThemedText>
+        <View style={styles.previousRecordsContainer}>
+          {recordsLoading ? (
+            <ActivityIndicator size="small" color="#007AFF" />
+          ) : attendanceRecords.length === 0 ? (
+            <ThemedText style={styles.recordText}>No previous records found.</ThemedText>
+          ) : (
+            <ScrollView style={{ maxHeight: 140 }}>
+              {attendanceRecords
+                .slice()
+                .sort((a, b) => b.id - a.id)
+                .map((rec) => (
+                  <TouchableOpacity
+                    key={rec.id}
+                    style={styles.previousRecordBox}
+                    onPress={() => {
+                      setSelectedRecord(rec);
+                      setEditModalVisible(true);
+                    }}
+                  >
+                    <ThemedText style={styles.recordText}>
+                      ID: {rec.id} | shift_start_time: {rec.shift_start_time} | shift_end_time: {rec.shift_end_time} | Status: {rec.status}
+                    </ThemedText>
+                  </TouchableOpacity>
+                ))}
+            </ScrollView>
+          )}
+        </View>
+
+        {/* Back Button */}
         <TouchableOpacity style={styles.backButton} onPress={handleBack}>
           <ThemedText style={styles.backButtonText}>{t('back')}</ThemedText>
         </TouchableOpacity>
+
+        {/* Update Modal */}
+        <UpdateAttendanceForm
+          visible={editModalVisible}
+          initialRecord={selectedRecord}
+          onClose={() => setEditModalVisible(false)}
+          onSave={async (updated) => {
+            if (!selectedRecord) return;
+            try {
+              const token = await SecureStore.getItemAsync('userToken');
+              const payload = {
+                shift_start_time: updated.shift_start_time,
+                shift_end_time: updated.shift_end_time,
+              };
+              await axios.put(`${getApiUrl('/api/attendance/records')}/${selectedRecord.id}`, payload, {
+                headers: { Authorization: `Bearer ${token}` },
+              });
+              setEditModalVisible(false);
+              setSelectedRecord(null);
+              if (employeeData) fetchAttendanceRecords(employeeData.employeeId);
+            } catch {
+              Alert.alert('Error', 'Failed to update record');
+            }
+          }}
+        />
       </View>
     </ThemedView>
   );
 };
 
 const styles = StyleSheet.create({
-  recordList: {
-    maxHeight: 200,
-    marginBottom: 10,
-  },
-  deleteButton: {
-    marginLeft: 10,
-    backgroundColor: '#ff4d4d',
-    padding: 5,
-    borderRadius: 5,
-  },
   container: {
     flex: 1,
-    backgroundColor: '#ffffff',
+    backgroundColor: '#f8f9fa',
+    paddingHorizontal: 15,
+    paddingTop: 20,
   },
   content: {
-    flex: 1,
-    width: '100%',
+    backgroundColor: '#fff',
+    borderRadius: 15,
     padding: 20,
-    alignItems: 'center',
-  },
-  loadingContainer: {
-    justifyContent: 'center',
-    alignItems: 'center',
+    marginBottom: 15,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 6 },
+    shadowOpacity: 0.1,
+    shadowRadius: 12,
+    elevation: 6,
+    position: 'relative',
   },
   card: {
-    backgroundColor: '#ffffff',
-    borderRadius: 20,
-    width: '100%',
-    alignItems: 'center',
-    paddingVertical: 30,
-    paddingHorizontal: 20,
-    marginBottom: 30,
+    backgroundColor: '#fff',
+    borderRadius: 15,
+    padding: 20,
+    marginBottom: 15,
     shadowColor: '#000',
-    shadowOffset: { width: 0, height: 4 },
+    shadowOffset: { width: 0, height: 6 },
     shadowOpacity: 0.1,
-    shadowRadius: 6,
+    shadowRadius: 12,
     elevation: 6,
+    position: 'relative',
   },
   profilePlaceholder: {
-    width: 100,
-    height: 100,
-    borderRadius: 50,
-    backgroundColor: '#d1d5db',
+    width: 70,
+    height: 70,
+    borderRadius: 35,
+    backgroundColor: '#0A73FF',
     justifyContent: 'center',
     alignItems: 'center',
-    marginBottom: 15,
+    position: 'absolute',
+    top: -35,
+    alignSelf: 'center',
+    borderWidth: 3,
+    borderColor: '#fff',
   },
   placeholderText: {
-    fontSize: 36,
-    color: '#666666',
+    color: '#fff',
     fontWeight: 'bold',
+    fontSize: 28,
   },
   name: {
+    marginTop: 45,
+    fontWeight: 'bold',
     fontSize: 18,
-    fontWeight: '700',
-    color: '#111827',
-    marginBottom: 5,
+    color: '#666',
+    textAlign: 'center',
+    opacity: 0.6,
   },
   subtext: {
     fontSize: 14,
-    color: '#4b5563',
-    marginBottom: 8,
+    color: '#333',
+    marginTop: 5,
+    textAlign: 'center',
   },
   rankBadge: {
-    backgroundColor: '#007AFF',
-    paddingHorizontal: 10,
-    paddingVertical: 4,
-    borderRadius: 6,
-    marginBottom: 20,
+    backgroundColor: '#FFD700',
+    borderRadius: 15,
+    paddingVertical: 7,
+    marginTop: 10,
+    alignItems: 'center',
+    width: '60%',
+    alignSelf: 'center',
   },
   rankBadgeText: {
-    color: '#ffffff',
+    color: '#222',
+    fontWeight: 'bold',
     fontSize: 14,
-    fontWeight: '600',
   },
   buttonRow: {
     flexDirection: 'row',
+    marginTop: 20,
     justifyContent: 'space-between',
-    gap: 20,
-    width: '80%',
   },
   inButton: {
-    backgroundColor: '#10B981',
-    borderRadius: 50,
-    paddingVertical: 12,
-    paddingHorizontal: 30,
+    backgroundColor: '#00A14B',
+    paddingVertical: 14,
     flex: 1,
-    alignItems: 'center',
+    marginRight: 12,
+    borderRadius: 8,
   },
   outButton: {
-    backgroundColor: '#B91C1C',
-    borderRadius: 50,
-    paddingVertical: 12,
-    paddingHorizontal: 30,
+    backgroundColor: '#E63946',
+    paddingVertical: 14,
     flex: 1,
-    alignItems: 'center',
+    marginLeft: 12,
+    borderRadius: 8,
   },
   buttonText: {
-    color: '#ffffff',
-    fontWeight: '600',
+    color: '#fff',
+    fontWeight: '700',
     fontSize: 16,
+    textAlign: 'center',
+  },
+  dateFilterRow: {
+    flexDirection: 'row',
+    marginBottom: 20,
+    justifyContent: 'space-between',
+  },
+  dateFilterButton: {
+    flex: 1,
+    marginHorizontal: 5,
+    paddingVertical: 10,
+    borderRadius: 8,
+    backgroundColor: '#d3d3d3',
+    alignItems: 'center',
+  },
+  dateFilterButtonActive: {
+    backgroundColor: '#0A73FF',
+  },
+  dateFilterText: {
+    color: '#333',
+    fontWeight: '600',
+  },
+  dateFilterTextActive: {
+    color: '#fff',
+  },
+  attendanceList: {
+    marginBottom: 20,
+  },
+  attendanceItem: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    borderBottomColor: '#ddd',
+    borderBottomWidth: 1,
+    paddingVertical: 12,
+    opacity: 0.4,
+  },
+  timeText: {
+    fontSize: 14,
+    color: '#999',
+  },
+  statusText: {
+    fontSize: 14,
+    color: '#999',
   },
   previousTitle: {
-    color: '#000',
-    fontSize: 16,
-    alignSelf: 'flex-start',
-    marginBottom: 8,
+    fontWeight: 'bold',
+    fontSize: 18,
+    marginBottom: 10,
   },
-  recordBox: {
-    width: '100%',
-    backgroundColor: '#f3f4f6',
+  previousRecordsContainer: {
+    backgroundColor: '#f0f0f0',
     borderRadius: 10,
-    padding: 15,
-    marginBottom: 30,
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+  },
+  previousRecordBox: {
+    backgroundColor: '#fff',
+    padding: 12,
+    borderRadius: 8,
+    marginBottom: 12,
   },
   recordText: {
-    color: '#374151',
     fontSize: 14,
+    color: '#222',
   },
   backButton: {
-    backgroundColor: '#333333',
-    paddingVertical: 14,
-    borderRadius: 10,
+    backgroundColor: '#222',
+    paddingVertical: 18,
+    borderRadius: 12,
     alignItems: 'center',
-    width: '100%',
+    marginTop: 15,
   },
   backButtonText: {
-    color: '#007AFF',
+    color: '#0A73FF',
     fontSize: 16,
     fontWeight: '600',
+  },
+  loadingContainer: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
   },
 });
 

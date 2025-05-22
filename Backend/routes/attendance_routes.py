@@ -120,20 +120,46 @@ def mark_attendance():
 @attendance_bp.route('/records', methods=['GET'])
 def get_attendance_records():
     try:
+        from datetime import datetime, timedelta
         emp_no = request.args.get('emp_no')
+        date_filter = request.args.get('date_filter')  # e.g. "today", "yesterday", "2025-05-21"
         if not emp_no:
             return jsonify({'success': False, 'message': 'emp_no query parameter is required'}), 400
 
         client = psycopg2.connect(database_url)
         db = client.cursor(cursor_factory=psycopg2.extras.DictCursor)
 
-        db.execute("""
+        # Date range logic
+        date_condition = ""
+        params = [emp_no]
+        today = datetime.now().date()
+        if not date_filter or date_filter.lower() == "today":
+            # Default to today if no filter is provided
+            start = today
+            end = today + timedelta(days=1)
+        elif date_filter.lower() == "yesterday":
+            start = today - timedelta(days=1)
+            end = today
+        else:
+            # Assume specific date in YYYY-MM-DD
+            try:
+                start = datetime.strptime(date_filter, "%Y-%m-%d").date()
+                end = start + timedelta(days=1)
+            except Exception:
+                return jsonify({'success': False, 'message': 'Invalid date_filter format'}), 400
+        # Always filter by date
+        print(f"[DEBUG] Querying attendance for emp_no={emp_no}, start={start}, end={end}")
+        db.execute(
+            """
             SELECT id, emp_no, shift_start_time, shift_end_time
             FROM attendance
-            WHERE emp_no = %s
-            ORDER BY shift_start_time DESC
-        """, (emp_no,))
+            WHERE emp_no = %s AND created_at::date >= %s AND created_at::date < %s
+            ORDER BY created_at DESC
+            """,
+            (emp_no, start, end)
+        )
         records = db.fetchall()
+        print(f"[DEBUG] Records fetched: {len(records)}")
         db.close()
         client.close()
 
@@ -183,12 +209,37 @@ def update_attendance_record(record_id):
             RETURNING id, emp_no, shift_start_time, shift_end_time, status
         """, (shift_start_time, shift_end_time, status, record_id))
         updated = db.fetchone()
+        print('DEBUG: type(updated) =', type(updated))
+        print('DEBUG: updated =', updated)
+        if not updated:
+            client.commit()
+            db.close()
+            client.close()
+            return jsonify({'success': False, 'message': 'Record not found'}), 404
+        # Always get column names from db.description
+        columns = [desc[0] for desc in db.description]
+
+        def to_serializable(val):
+            import datetime
+            if isinstance(val, (str, int, float, bool)) or val is None:
+                return val
+            if hasattr(val, "isoformat"):
+                return val.isoformat()
+            if hasattr(val, "strftime"):
+                return val.strftime('%H:%M:%S')
+            return str(val)
+
+        # Force conversion for every value, regardless of row type
+        record_serializable = {}
+        for idx, col in enumerate(columns):
+            v = updated[idx] if hasattr(updated, '__getitem__') else getattr(updated, col, None)
+            record_serializable[col] = to_serializable(v)
+            print(f"Column: {col}, Type: {type(v)}, Value: {v}, Serialized: {record_serializable[col]}")
+
         client.commit()
         db.close()
         client.close()
-        if not updated:
-            return jsonify({'success': False, 'message': 'Record not found'}), 404
-        return jsonify({'success': True, 'record': dict(updated)}), 200
+        return jsonify({'success': True, 'record': record_serializable}), 200
     except Exception as e:
         traceback.print_exc()
         return jsonify({'success': False, 'message': f'Error updating record: {str(e)}'}), 500

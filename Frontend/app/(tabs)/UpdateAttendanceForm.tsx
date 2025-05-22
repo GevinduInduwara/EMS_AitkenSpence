@@ -37,7 +37,9 @@ const UpdateAttendanceForm: React.FC<UpdateAttendanceFormProps> = ({
 }) => {
   const recordDate = parseDateSafe(initialRecord?.shift_start_time) || new Date();
   const [shiftStart, setShiftStart] = useState<Date | null>(parseDateSafe(initialRecord?.shift_start_time) || new Date());
-  const [shiftEnd, setShiftEnd] = useState<Date | null>(parseDateSafe(initialRecord?.shift_end_time));
+  const [shiftEnd, setShiftEnd] = useState<Date | null>(
+  parseDateSafe(initialRecord?.shift_end_time) || parseDateSafe(initialRecord?.shift_start_time) || new Date()
+);
 
   const [showStartPicker, setShowStartPicker] = useState(false);
   const [showEndPicker, setShowEndPicker] = useState(false);
@@ -65,8 +67,8 @@ const UpdateAttendanceForm: React.FC<UpdateAttendanceFormProps> = ({
       return;
     }
     onSave({
-      shift_start_time: start.toISOString(),
-      shift_end_time: end ? end.toISOString() : null,
+      shift_start_time: start.toTimeString().slice(0, 8),
+      shift_end_time: end ? end.toTimeString().slice(0, 8) : null,
     });
   };
 
@@ -140,7 +142,7 @@ const UpdateAttendanceForm: React.FC<UpdateAttendanceFormProps> = ({
               <View style={styles.timePickerModalOverlay}>
                 <View style={styles.timePickerModalContent}>
                   <DateTimePicker
-                    value={shiftEnd || new Date()}
+                    value={tempEndTime || shiftEnd || shiftStart || new Date()}
                     mode="time"
                     display={Platform.OS === 'ios' ? 'spinner' : 'default'}
                     textColor={Platform.OS === 'ios' ? '#000' : undefined}
